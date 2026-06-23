@@ -1,0 +1,173 @@
+# AGENTS — process-compliance-engine
+
+Indice del harness SDD. Todo agente debe leer este archivo como primer paso de su boot sequence.
+
+---
+
+## Proyecto
+
+**Servicio:** process-compliance-engine
+**Dominio:** [COMPLETAR CON INFORMACION: dominio de negocio]
+**Stack:** [COMPLETAR CON INFORMACION: tecnologias principales]
+**Paquete base:** [COMPLETAR CON INFORMACION: paquete raiz del proyecto]
+
+---
+
+## Agentes Registrados
+
+| Archivo | Nombre | Rol | Cuando usarlo |
+|---|---|---|---|
+| `.github/agents/domain-orchestrator.agent.md` | `domain-orchestrator` | Coordinacion del ciclo SDD. Delega a sub-agentes. NUNCA implementa codigo. | Para flujos multi-step: guia al desarrollador por las etapas |
+| `.github/agents/backend-analyst.agent.md` | `backend-analyst` | Exploracion y analisis del codebase. Produce `explore.md`. NUNCA escribe codigo de produccion. | Al iniciar una feature: identificar entidades, servicios y gaps |
+| `.github/agents/backend-architect.agent.md` | `backend-architect` | Diseno de modulos, flujos y documentos SDD. Produce `proposal.md`, `spec.md`, `design.md`, `tasks.md`. NUNCA escribe codigo. | Antes de codificar: disenar capas, handlers, contratos |
+| `.github/agents/backend-developer.agent.md` | `backend-developer` | Generacion de codigo. Implementa tareas aprobadas de `tasks.md`. Una tarea a la vez. | Implementacion concreta de todas las capas |
+| `.github/agents/code-reviewer.agent.md` | `code-reviewer` | Revisa el diff del apply. NUNCA edita codigo. | Post-apply: detectar violaciones de convencion, bugs y problemas de seguridad |
+| `.github/agents/test-engineer.agent.md` | `test-engineer` | Escribe tests unitarios mockeados. | Post-implementacion: asegurar >= 80% cobertura |
+| `.github/agents/sdd-verifier.agent.md` | `sdd-verifier` | Produce `verify-report.md`. NUNCA modifica codigo de produccion ni tests. | Antes de merge: validar anotaciones, privilegios, HTTP codes |
+| `.github/agents/api-contract-reviewer.agent.md` | `api-contract-reviewer` | Valida contratos REST. Detecta breaking changes. | Al agregar/modificar endpoints: validar OpenAPI y docs |
+
+---
+
+## Flujos SDD
+
+### Punto de Entrada
+
+Antes de iniciar cualquier flujo, completar el template de request:
+
+```
+openspec/templates/request-template.md  ->  copiar a openspec/changes/<change-name>/request.md
+```
+
+### Flujo Completo
+
+Usar cuando la feature requiere al menos uno de:
+- Nueva tabla o cambios de esquema en DB
+- Nueva integracion con sistema externo
+- Nuevo handler async
+- Mas de 3 archivos de produccion afectados
+- Cambios en la configuracion de seguridad
+
+```
+request -> explore -> propose -> spec -> design -> tasks -> apply -> review -> tests -> api-gate -> verify -> archive
+```
+
+| Etapa | Prompt | Agente | Artefacto |
+|---|---|---|---|
+| 1 | `sdd-explore` | Backend Analyst | `explore.md` |
+| 2 | `sdd-propose` | Backend Architect | `proposal.md` |
+| 3 | `sdd-spec` | Backend Architect | `spec.md` |
+| 4 | `sdd-design` | Backend Architect | `design.md` |
+| 5 | `sdd-tasks` | Backend Architect | `tasks.md` |
+| 6 | `sdd-apply` | Backend Developer | codigo fuente |
+| 7 | — | Code Reviewer | `review-notes.md` |
+| 8 | `sdd-tests` | Test Engineer | tests unitarios |
+| 9 | — | API Contract Reviewer | seccion en verify-report |
+| 10 | `sdd-verify` | SDD Verifier | `verify-report.md` |
+| 11 | — | Orchestrator | mover a `archive/` |
+
+### Flujo Reducido
+
+Usar cuando la feature cumple TODOS estos puntos:
+- Sin nueva tabla (puede agregar columnas a tabla existente)
+- Sin nueva integracion externa
+- Sin nuevo handler async
+- Maximo 3 archivos de produccion afectados
+- Sin nuevo endpoint publico ni nueva regla de dominio
+
+```
+request -> explore -> design -> tasks -> apply -> tests -> verify
+```
+
+| Etapa | Prompt | Agente | Artefacto |
+|---|---|---|---|
+| 1 | `sdd-explore` | Backend Analyst | `explore.md` |
+| 2 | `sdd-design` | Backend Architect | `design.md` |
+| 3 | `sdd-tasks` | Backend Architect | `tasks.md` |
+| 4 | `sdd-apply` | Backend Developer | codigo fuente |
+| 5 | `sdd-tests` | Test Engineer | tests unitarios |
+| 6 | `sdd-verify` | SDD Verifier | `verify-report.md` |
+
+Cuando haya duda, usar el flujo completo.
+
+---
+
+## Prompts
+
+| Prompt | Archivo | Proposito |
+|---|---|---|
+| `sdd-explore` | `prompts/sdd-explore.prompt.md` | Analisis completo del dominio actual |
+| `sdd-propose` | `prompts/sdd-propose.prompt.md` | Propuesta de diseno desde lenguaje natural |
+| `sdd-spec` | `prompts/sdd-spec.prompt.md` | Documento spec estructurado |
+| `sdd-design` | `prompts/sdd-design.prompt.md` | Diseno tecnico detallado por capas |
+| `sdd-tasks` | `prompts/sdd-tasks.prompt.md` | Descomposicion en tareas atomicas |
+| `sdd-apply` | `prompts/sdd-apply.prompt.md` | Implementacion de codigo desde tasks |
+| `sdd-tests` | `prompts/sdd-tests.prompt.md` | Suite de tests unitarios >= 80% cobertura |
+| `sdd-verify` | `prompts/sdd-verify.prompt.md` | Verificacion diseno vs implementacion |
+
+---
+
+## Estructura de openspec
+
+```
+openspec/
+├── config.yaml                          configuracion del harness
+├── templates/                           plantillas por artefacto
+│   ├── request-template.md
+│   ├── explore-template.md
+│   ├── proposal-template.md
+│   ├── spec-template.md
+│   ├── design-template.md
+│   ├── tasks-template.md
+│   └── verify-report-template.md
+└── changes/
+    ├── <change-name>/                   cambio activo
+    │   ├── request.md
+    │   ├── explore.md
+    │   ├── proposal.md  (flujo completo)
+    │   ├── spec.md      (flujo completo)
+    │   ├── design.md
+    │   ├── tasks.md
+    │   ├── verify-report.md
+    │   └── review-notes.md  (opcional)
+    └── archive/
+        └── YYYY-MM-DD-<change-name>/    cambio completado
+```
+
+---
+
+## Convenciones de Codificacion
+
+Ver `.github/copilot-instructions.md` para el resumen y los archivos de instrucciones para el detalle:
+- `.github/instructions/coding-standards.instructions.md`
+- `.github/instructions/api-contracts.instructions.md`
+- `.github/instructions/testing.instructions.md`
+
+---
+
+## Instrucciones Activas
+
+Aplicadas automaticamente segun el archivo que se edita:
+
+| Archivo | Scope |
+|---|---|
+| `instructions/coding-standards.instructions.md` | [COMPLETAR CON INFORMACION: glob de fuentes] |
+| `instructions/api-contracts.instructions.md` | [COMPLETAR CON INFORMACION: glob de controllers] |
+| `instructions/testing.instructions.md` | [COMPLETAR CON INFORMACION: glob de tests] |
+
+---
+
+## Contexto de Dominio
+
+Ver `docs/context/INDEX.md` para el indice completo.
+
+---
+
+## Phase Gates (bloqueantes)
+
+| Gate | Condicion |
+|---|---|
+| No avanzar a `propose`/`design` | Sin `explore.md` aprobado |
+| No avanzar a `apply` | Sin `design.md` Y `tasks.md` aprobados |
+| No avanzar a `tests` | Sin compilacion exitosa de todas las tareas objetivo |
+| No avanzar a `verify` | Sin tests en verde |
+| No avanzar a `archive` | Sin `verify-report.md` con recomendacion "ready for archive" Y aprobacion humana |
