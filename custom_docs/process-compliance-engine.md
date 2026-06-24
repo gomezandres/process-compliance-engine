@@ -7,13 +7,14 @@
 
 El sistema actual tiene múltiples aplicaciones distribuidas en stacks tecnológicos heterogéneos que se ejecutan de forma programada en Kubernetes CronJobs o lambdas.
 
-La necesidad evoluciona desde reportería hacia monitoreo de procesos. El reporte es un resultado final; lo importante es validar la ejecución completa del proceso contra reglas de negocio y operación.
+La necesidad evoluciona desde reportería hacia monitoreo de procesos. El reporte es un resultado final; lo importante es validar el ciclo de vida completo del proceso (inicio y fin) contra reglas de negocio y operación.
 
 ### Problema a resolver
 
-- Dispersión: no existe un punto central para validar el cierre de procesos.
+- Dispersión: no existe un punto central para validar el inicio y cierre de procesos.
 - Cobertura limitada: se observa el reporte final, pero no la gobernanza del proceso.
 - Falta de control operativo: no hay evaluación consistente por reglas, SLA y destino esperado.
+- Visibilidad parcial: sin el evento de inicio no es posible calcular duración real ni detectar procesos colgados.
 
 ---
 
@@ -21,10 +22,11 @@ La necesidad evoluciona desde reportería hacia monitoreo de procesos. El report
 
 Arquitectura simple y directa:
 
-1. Un proceso termina y publica un evento en RabbitMQ.
-2. process-compliance-engine consume ese evento.
-3. process-compliance-engine consulta MySQL con la configuración del proceso.
-4. process-compliance-engine evalúa reglas y envía alertas según el caso.
+1. Un proceso inicia y publica un evento de inicio en RabbitMQ.
+2. Un proceso termina y publica un evento de fin en RabbitMQ.
+3. process-compliance-engine consume ambos tipos de eventos desde la misma queue (`process.event.lifecycle`).
+4. process-compliance-engine consulta MySQL con la configuración del proceso.
+5. process-compliance-engine evalúa reglas y envía alertas según el caso.
 
 ```mermaid
 flowchart TD
@@ -35,7 +37,7 @@ flowchart TD
     end
 
     subgraph MQ["Mensajería"]
-        RabbitMQ[["RabbitMQ\nprocess.event.completed"]]
+        RabbitMQ[["RabbitMQ\nprocess.event.lifecycle"]]
     end
 
     subgraph Core["Núcleo Central"]
@@ -47,7 +49,7 @@ flowchart TD
         Sync["Sincronizador\nplatform -> MySQL"]
     end
 
-    subgraph Out["Salidas (opcional)"]
+    subgraph Out["Salidas"]
         Registry[("Registro de ejecución")]
     end
 
@@ -78,21 +80,22 @@ flowchart TD
 
 Cada proceso publica un único evento cuando termina (éxito o fallo). No necesita conocer la lógica de monitoreo.
 
-### B. RabbitMQ (`process.event.completed`)
+### B. RabbitMQ (`process.event.lifecycle`)
 
-Canal único de recepción de eventos de cierre de proceso.
+Canal único de recepción de eventos de ciclo de vida de proceso (inicio y fin).
 
 - Desacopla productores del monitor central.
 - Permite escalar sin cambiar contratos por aplicación.
+- Routing keys: `process.lifecycle.started` para inicio, `process.lifecycle.completed` para fin.
 
 ### C. process-compliance-engine
 
 Componente central que:
 
-- Consume eventos de finalización.
-- Busca la configuración del proceso en MySQL.
-- Evalúa reglas de validación.
-- Registra resultado y dispara alertas cuando aplica.
+- Consume eventos de inicio y fin desde `process.event.lifecycle`.
+- Registra el inicio de ejecución al recibir `PROCESS_STARTED`.
+- Al recibir `PROCESS_COMPLETED`: busca configuración en MySQL, evalúa reglas y dispara alertas.
+- Permite detectar procesos colgados (inicio sin fin dentro de una ventana de tiempo).
 - **Expone métricas en el endpoint `/metrics`** en formato Prometheus (Micrometer o cliente equivalente).
 
 ### D. MySQL como fuente de información operativa
@@ -111,31 +114,84 @@ Servicio o job que mantiene MySQL actualizado desde platform.
 
 ---
 
-## 4. Contrato mínimo del evento
+## 4. Contrato de eventos
 
-Campos recomendados para `process.event.completed`:
+Se reciben dos tipos de eventos publicados en la queue `process.event.lifecycle`.
+
+### 4.1 Evento de inicio (`process.lifecycle.started`)
+
+Campos requeridos:
 
 - processKey
 - executionId
-- finishedAt
-- status (`SUCCESS` o `FAILED`)
-- durationMs
+- startedAt
 - sourceSystem
-- errorCode (opcional)
-- errorMessage (opcional)
 
 Ejemplo:
 
 ```json
 {
-  "processKey": "asiento-cero-diario",
-  "executionId": "exec-20260619-001",
-  "finishedAt": "2026-06-19T08:12:00Z",
-  "status": "SUCCESS",
-  "durationMs": 540000,
-  "sourceSystem": "asiento-cero-hub"
+  "eventId": "uuid",
+  "timestamp": "2026-06-19T08:02:30.000000Z",
+  "source": "asiento-cero-hub",
+  "type": "PROCESS_STARTED",
+  "contextId": "daily-report-job",
+  "payload": {
+    "processKey": "asiento-cero-diario",
+    "executionId": "exec-20260619-001",
+    "status": "RUNNING",
+    "scheduledAt": "2026-06-19T08:00:00",
+    "startedAt": "2026-06-19T08:02:30",
+    "metadata": {}
+  }
 }
 ```
+
+### 4.2 Evento de fin (`process.lifecycle.completed`)
+
+Campos requeridos:
+
+- processKey
+- executionId
+- status (`COMPLETED` o `FAILED`)
+
+Campos opcionales:
+
+- scheduledAt, startedAt, endedAt
+- durationMs
+- errorCode, errorMessage
+- metadata
+
+Ejemplo:
+
+```json
+{
+  "eventId": "uuid",
+  "timestamp": "2026-06-19T08:15:45.000000Z",
+  "source": "asiento-cero-hub",
+  "type": "PROCESS_COMPLETED",
+  "contextId": "daily-report-job",
+  "payload": {
+    "processKey": "asiento-cero-diario",
+    "executionId": "exec-20260619-001",
+    "status": "COMPLETED",
+    "scheduledAt": "2026-06-19T08:00:00",
+    "startedAt": "2026-06-19T08:02:30",
+    "endedAt": "2026-06-19T08:15:45",
+    "durationMs": 789000,
+    "errorCode": null,
+    "errorMessage": null,
+    "metadata": {}
+  }
+}
+```
+
+### 4.3 Comportamiento del motor por tipo de evento
+
+| Tipo de evento | Acción del motor |
+|---|---|
+| `PROCESS_STARTED` | Registra inicio de ejecución. No evalúa reglas aún. Permite detectar procesos colgados (sin evento de fin). |
+| `PROCESS_COMPLETED` | Completa el registro de ejecución y evalúa todas las reglas configuradas. Genera alertas si hay violaciones. |
 
 ---
 
@@ -148,9 +204,10 @@ Prometheus realiza scraping periódico de ese endpoint. Grafana consume Promethe
 
 | Métrica | Tipo | Descripción |
 |---|---|---|
-| `pce_events_received_total` | Counter | Total de eventos recibidos desde RabbitMQ |
-| `pce_events_evaluated_total` | Counter | Total de eventos evaluados (etiqueta: `result=ok\|fail`) |
+| `pce_events_received_total` | Counter | Total de eventos recibidos (etiqueta: `type=started\|completed`) |
+| `pce_events_evaluated_total` | Counter | Total de eventos de fin evaluados (etiqueta: `result=ok\|fail`) |
 | `pce_events_unknown_process_total` | Counter | Eventos de procesos sin configuración en MySQL |
+| `pce_executions_hung_total` | Counter | Procesos con inicio registrado pero sin fin dentro de la ventana esperada |
 | `pce_rule_violations_total` | Counter | Violaciones de reglas (etiqueta: `rule_type`, `severity`) |
 | `pce_sla_exceeded_total` | Counter | Ejecuciones que superaron el SLA configurado |
 | `pce_evaluation_duration_seconds` | Histogram | Tiempo de evaluación por evento |
@@ -170,13 +227,14 @@ Las alarmas se definen en Grafana sobre queries PromQL ejecutadas contra Prometh
 
 ## 6. Reglas de evaluación en process-compliance-engine
 
-Reglas mínimas sugeridas:
+Reglas mínimas sugeridas (se evalúan al recibir `PROCESS_COMPLETED`):
 
 1. Proceso no configurado en MySQL: alerta de configuración.
 2. Estado `FAILED`: alerta crítica.
 3. SLA excedido: alerta de cumplimiento.
 4. Evento con contrato incompleto o inválido: alerta de integridad de contrato.
 5. Evento duplicado por `executionId`: deduplicar y registrar.
+6. Proceso colgado: inicio registrado sin evento de fin dentro de la ventana esperada (detectado por job periódico, no en tiempo real).
 
 Nota de alcance:
 

@@ -50,7 +50,7 @@ mvn spring-boot:run                                  # start locally (once Sprin
 
 ```
 custom_docs/                         # Full design specs — read these before implementing
-src/main/java/com/flexibilitytech/pce/
+src/main/java/com/flexibility/pce/
 ├── application/        # Orchestration: @Transactional lives here only
 │   ├── service/        # ProcessComplianceService (main entry), ProcessExecutionService
 │   ├── event/          # ProcessCompletionEventPayload, ProcessCompletionEventHandler
