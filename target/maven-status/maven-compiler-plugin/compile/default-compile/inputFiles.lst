@@ -62,3 +62,8 @@
 /home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/pce/infrastructure/resilience/RabbitMQCircuitBreaker.java
 /home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/pce/presentation/controller/HealthController.java
 /home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/pce/presentation/metrics/PrometheusMetricsRegistry.java
+/home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/plug/consumer/rabbitmq/RabbitMQConnectionConfig.java
+/home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/plug/consumer/rabbitmq/RabbitMQConsumer.java
+/home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/plug/consumer/rabbitmq/RabbitMQConsumerConfig.java
+/home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/plug/events/common/EventMessage.java
+/home/guri/repositorios-privado/process-compliance-engine/src/main/java/com/flexibility/plug/events/common/TypedEventHandler.java

@@ -2,8 +2,8 @@ package com.flexibility.pce.infrastructure.cache;
 
 import com.flexibility.pce.domain.entity.ProcessDefinition;
 import com.flexibility.pce.domain.repository.ProcessDefinitionRepository;
-import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
@@ -17,7 +17,7 @@ import java.util.Optional;
 public class ProcessDefinitionCache {
 
     private final ProcessDefinitionRepository repository;
-    private final Cache<String, ProcessDefinition> cache;
+    private final LoadingCache<String, ProcessDefinition> cache;
     private final MeterRegistry meterRegistry;
 
     public ProcessDefinitionCache(ProcessDefinitionRepository repository, MeterRegistry meterRegistry) {
