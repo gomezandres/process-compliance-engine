@@ -23,7 +23,7 @@ Stack objetivo de implementación:
 
 ```
 process-compliance-engine/
-├── src/main/java/com/flexibilitytech/pce/
+├── src/main/java/com/flexibility/pce/
 │   ├── application/
 │   │   ├── service/
 │   │   │   ├── ProcessComplianceService.java
