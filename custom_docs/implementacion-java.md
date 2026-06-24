@@ -742,139 +742,125 @@ public class RuleEngine {
 @Slf4j
 @Transactional
 public class ProcessComplianceService {
-    
+
     private final ProcessDefinitionRepository processDefinitionRepo;
     private final ProcessExecutionService executionService;
     private final RuleEngine ruleEngine;
     private final AlertService alertService;
     private final ProcessEventPublisher eventPublisher;
     private final MeterRegistry meterRegistry;
-    
+
     /**
-     * Punto de entrada principal: procesa un evento de finalización.
-     * Implementa lógica de resiliencia y deduplicación.
+     * Maneja evento PROCESS_STARTED: solo registra el inicio.
+     * No evalúa reglas — la evaluación ocurre al recibir PROCESS_COMPLETED.
      */
-    @CircuitBreaker(name = "processCompliance", fallbackMethod = "handleCircuitBreakerFallback")
+    @CircuitBreaker(name = "processCompliance", fallbackMethod = "handleStartFallback")
     @Retry(name = "processCompliance")
-    @Timeout(value = "5s")
-    public void processCompletionEvent(
-        ProcessCompletionEventPayload payload,
-        String eventId,
-        String source,
-        String eventTimestamp) {
-        
-        long startTime = System.currentTimeMillis();
-        meterRegistry.counter("pce_events_received_total").increment();
-        
+    public void processStartEvent(
+            ProcessLifecycleEventPayload payload,
+            String eventId, String source, String eventTimestamp) {
+
         try {
-            log.info("Processing event {} from source: {}, process: {}, execution: {}",
-                eventId, source, payload.getProcessKey(), payload.getExecutionId());
-            
-            // 1. Validar contrato del evento
-            validatePayload(payload);
-            
-            // 2. Verificar deduplicación
-            if (executionService.existsExecution(
-                payload.getProcessKey(), 
-                payload.getExecutionId())) {
-                
-                log.warn("Duplicate execution detected: {}", payload.getExecutionId());
+            log.info("Recording start event={} process={} execution={}",
+                eventId, payload.getProcessKey(), payload.getExecutionId());
+
+            if (executionService.existsExecution(payload.getProcessKey(), payload.getExecutionId())) {
+                log.warn("Duplicate start event ignored: execution={}", payload.getExecutionId());
                 meterRegistry.counter("pce_duplicate_executions_total").increment();
                 return;
             }
-            
-            // 3. Cargar definición del proceso
+
+            executionService.recordStart(payload, eventId, source);
+
+        } catch (Exception e) {
+            log.error("Error recording start event: {}", eventId, e);
+            meterRegistry.counter("pce_processing_errors_total").increment();
+            throw new EventProcessingException("Failed to record start event", e);
+        }
+    }
+
+    /**
+     * Maneja evento PROCESS_COMPLETED: actualiza la ejecución y evalúa reglas.
+     */
+    @CircuitBreaker(name = "processCompliance", fallbackMethod = "handleCompletionFallback")
+    @Retry(name = "processCompliance")
+    @Timeout(value = "5s")
+    public void processCompletionEvent(
+            ProcessLifecycleEventPayload payload,
+            String eventId, String source, String eventTimestamp) {
+
+        long startTime = System.currentTimeMillis();
+        try {
+            log.info("Processing completion event={} process={} execution={}",
+                eventId, payload.getProcessKey(), payload.getExecutionId());
+
+            // 1. Cargar definición del proceso
             ProcessDefinition definition = processDefinitionRepo
                 .findByProcessKey(payload.getProcessKey())
                 .orElseThrow(() -> new ProcessNotConfiguredException(
                     "Process not found: " + payload.getProcessKey()));
-            
-            // 4. Registrar ejecución con metadata del evento
+
+            // 2. Completar registro (o crear si no llegó el evento de inicio)
             ProcessExecution execution = executionService
-                .recordExecution(payload, definition, eventId, source);
-            
-            // 5. Evaluar reglas
-            EvaluationResult result = ruleEngine.evaluateProcess(
-                execution, definition);
-            
-            meterRegistry.counter(
-                "pce_events_evaluated_total",
-                "result", result.getStatus().toString()
-            ).increment();
-            
-            // 6. Disparar alertas si hay violaciones
+                .completeExecution(payload, definition, eventId, source);
+
+            // 3. Evaluar reglas
+            EvaluationResult result = ruleEngine.evaluateProcess(execution, definition);
+
+            meterRegistry.counter("pce_events_evaluated_total",
+                "result", result.getStatus().toString()).increment();
+
+            // 4. Disparar alertas si hay violaciones
             if (result.getStatus() == EvaluationStatus.FAIL) {
                 handleViolations(result, definition);
             }
-            
-            // 7. Publicar evento de resultado
+
+            // 5. Publicar resultado
             eventPublisher.publishEvaluationResult(result, source);
-            
-            long duration = System.currentTimeMillis() - startTime;
-            log.info("Event {} processed successfully in {}ms", eventId, duration);
-            
+
+            log.info("Completion event {} processed in {}ms",
+                eventId, System.currentTimeMillis() - startTime);
+
         } catch (ProcessNotConfiguredException e) {
             log.error("Process not configured: {}", payload.getProcessKey());
             meterRegistry.counter("pce_events_unknown_process_total").increment();
             alertService.raiseConfigurationAlert(payload.getProcessKey(), e.getMessage());
-            
+
         } catch (Exception e) {
-            log.error("Unexpected error processing event: {}", eventId, e);
+            log.error("Unexpected error processing completion event: {}", eventId, e);
             meterRegistry.counter("pce_processing_errors_total").increment();
-            throw new EventProcessingException("Failed to process event", e);
+            throw new EventProcessingException("Failed to process completion event", e);
         }
     }
-    
-    private void validatePayload(ProcessCompletionEventPayload payload) {
-        if (payload.getProcessKey() == null || payload.getProcessKey().isBlank()) {
-            throw new InvalidEventContractException("processKey is required");
-        }
-        if (payload.getExecutionId() == null || payload.getExecutionId().isBlank()) {
-            throw new InvalidEventContractException("executionId is required");
-        }
-        if (payload.getStatus() == null) {
-            throw new InvalidEventContractException("status is required");
-        }
-    }
-    
-    private void handleViolations(EvaluationResult result, 
-        ProcessDefinition definition) {
-        
+
+    private void handleViolations(EvaluationResult result, ProcessDefinition definition) {
         for (RuleViolation violation : result.getViolations()) {
-            
-            String message = String.format(
-                "[%s] Rule violation in process '%s': %s",
-                violation.getSeverity(),
-                definition.getProcessKey(),
-                violation.getMessage()
-            );
-            
             AlertDTO alert = AlertDTO.builder()
                 .processKey(definition.getProcessKey())
                 .severity(violation.getSeverity())
-                .message(message)
+                .message(String.format("[%s] Rule violation in process '%s': %s",
+                    violation.getSeverity(), definition.getProcessKey(), violation.getMessage()))
                 .ruleType(violation.getRuleType())
                 .build();
-            
+
             alertService.sendAlert(alert);
-            
+
             if (violation.getSeverity() == Severity.CRITICAL) {
                 meterRegistry.counter("pce_critical_alerts_total").increment();
             }
         }
     }
-    
-    // Fallback para circuit breaker
-    public void handleCircuitBreakerFallback(
-        ProcessCompletionEventPayload payload, 
-        String eventId,
-        String source,
-        String eventTimestamp,
-        Exception ex) {
-        
-        log.error("Circuit breaker activated for event: {}", eventId, ex);
-        // Enqueuer el evento para reintentar más tarde
-        meterRegistry.counter("pce_circuit_breaker_activations").increment();
+
+    public void handleStartFallback(ProcessLifecycleEventPayload payload,
+            String eventId, String source, String ts, Exception ex) {
+        log.error("Circuit breaker activated for start event: {}", eventId, ex);
+        meterRegistry.counter("pce_circuit_breaker_activations", "type", "start").increment();
+    }
+
+    public void handleCompletionFallback(ProcessLifecycleEventPayload payload,
+            String eventId, String source, String ts, Exception ex) {
+        log.error("Circuit breaker activated for completion event: {}", eventId, ex);
+        meterRegistry.counter("pce_circuit_breaker_activations", "type", "completion").increment();
     }
 }
 ```
@@ -886,66 +872,85 @@ public class ProcessComplianceService {
 @Service
 @Slf4j
 public class ProcessExecutionService {
-    
+
     private final ProcessExecutionRepository executionRepository;
     private final ProcessExecutionQueries executionQueries;
-    
+    private final ObjectMapper objectMapper;
+
+    /** Crea el registro con estado RUNNING al recibir PROCESS_STARTED. */
     @Transactional
-    public ProcessExecution recordExecution(
-        ProcessCompletionEventPayload payload,
-        ProcessDefinition definition,
-        String eventId,
-        String source) {
-        
+    public ProcessExecution recordStart(
+            ProcessLifecycleEventPayload payload, String eventId, String source) {
+
         ProcessExecution execution = ProcessExecution.builder()
             .executionId(payload.getExecutionId())
-            .processKey(definition.getProcessKey())
+            .processKey(payload.getProcessKey())
             .scheduledAt(payload.getScheduledAt())
             .startedAt(payload.getStartedAt())
-            .endedAt(payload.getEndedAt())
-            .durationMs(payload.getDurationMs())
-            .status(ExecutionStatus.valueOf(payload.getStatus()))
-            .errorCode(payload.getErrorCode())
-            .errorMessage(payload.getErrorMessage())
+            .status(ExecutionStatus.RUNNING)
             .metadata(serializeMetadata(payload.getMetadata(), eventId, source))
             .build();
-        
+
         return executionRepository.save(execution);
     }
-    
+
+    /**
+     * Completa el registro al recibir PROCESS_COMPLETED.
+     * Si el evento de inicio no llegó (registro inexistente), crea uno completo.
+     */
+    @Transactional
+    public ProcessExecution completeExecution(
+            ProcessLifecycleEventPayload payload,
+            ProcessDefinition definition,
+            String eventId, String source) {
+
+        return executionRepository
+            .findByProcessKeyAndExecutionId(payload.getProcessKey(), payload.getExecutionId())
+            .map(existing -> {
+                existing.setEndedAt(payload.getEndedAt());
+                existing.setDurationMs(payload.getDurationMs());
+                existing.setStatus(ExecutionStatus.valueOf(payload.getStatus()));
+                existing.setErrorCode(payload.getErrorCode());
+                existing.setErrorMessage(payload.getErrorMessage());
+                return executionRepository.save(existing);
+            })
+            .orElseGet(() -> {
+                log.warn("No start record found for execution={}, creating full record",
+                    payload.getExecutionId());
+                ProcessExecution execution = ProcessExecution.builder()
+                    .executionId(payload.getExecutionId())
+                    .processKey(definition.getProcessKey())
+                    .scheduledAt(payload.getScheduledAt())
+                    .startedAt(payload.getStartedAt())
+                    .endedAt(payload.getEndedAt())
+                    .durationMs(payload.getDurationMs())
+                    .status(ExecutionStatus.valueOf(payload.getStatus()))
+                    .errorCode(payload.getErrorCode())
+                    .errorMessage(payload.getErrorMessage())
+                    .metadata(serializeMetadata(payload.getMetadata(), eventId, source))
+                    .build();
+                return executionRepository.save(execution);
+            });
+    }
+
     public boolean existsExecution(String processKey, String executionId) {
         return executionQueries.existsExecutionId(processKey, executionId);
     }
-    
+
     public Optional<ProcessExecution> getLastExecution(String processKey) {
         return executionQueries.findLastExecutionByProcessKey(processKey);
     }
-    
-    /**
-     * Serializar metadata incluyendo información de trazabilidad.
-     */
-    private String serializeMetadata(Map<String, Object> payload, 
-        String eventId, String source) {
-        
+
+    private String serializeMetadata(Map<String, Object> payload, String eventId, String source) {
         try {
-            Map<String, Object> metadata = payload != null 
-                ? new HashMap<>(payload) 
-                : new HashMap<>();
-            
+            Map<String, Object> metadata = payload != null ? new HashMap<>(payload) : new HashMap<>();
             metadata.put("_eventId", eventId);
             metadata.put("_source", source);
-            metadata.put("_recordedAt", LocalDateTime.now().toString());
-            
-            return new ObjectMapper().writeValueAsString(metadata);
-            
+            return objectMapper.writeValueAsString(metadata);
         } catch (Exception e) {
             log.error("Error serializing metadata", e);
             return "{}";
         }
-    }
-}
-```
-        return executionQueries.findLastExecutionByProcessKey(processKey);
     }
 }
 ```
@@ -1176,120 +1181,100 @@ public class UnsupportedRuleTypeException extends ProcessComplianceException {
 
 ### 9.1 Modelo de Payload del Evento
 
+Un único payload cubre ambos tipos de evento. Los campos de fin (`endedAt`, `durationMs`, `errorCode`, `errorMessage`) son nulos en el evento de inicio.
+
 ```java
-// application/event/ProcessCompletionEventPayload.java
+// application/event/ProcessLifecycleEventPayload.java
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
 @Builder
-public class ProcessCompletionEventPayload {
-    
+public class ProcessLifecycleEventPayload {
+
     private String processKey;
     private String executionId;
-    private String status; // COMPLETED, FAILED, SKIPPED
+    private String status; // RUNNING, COMPLETED, FAILED, SKIPPED
     private LocalDateTime scheduledAt;
     private LocalDateTime startedAt;
-    private LocalDateTime endedAt;
-    private Long durationMs;
-    private String errorCode;
-    private String errorMessage;
+    private LocalDateTime endedAt;    // null en PROCESS_STARTED
+    private Long durationMs;          // null en PROCESS_STARTED
+    private String errorCode;         // null en PROCESS_STARTED
+    private String errorMessage;      // null en PROCESS_STARTED
     private Map<String, Object> metadata;
 }
 ```
 
 ### 9.2 Consumidor de Eventos
 
+El consumidor despacha por `event.getType()`: `PROCESS_STARTED` registra el inicio; `PROCESS_COMPLETED` completa el registro y dispara evaluación de reglas.
+
 ```java
 // infrastructure/messaging/ProcessEventConsumer.java
 @Component
 @Slf4j
 public class ProcessEventConsumer {
-    
+
+    private static final String TYPE_STARTED   = "PROCESS_STARTED";
+    private static final String TYPE_COMPLETED = "PROCESS_COMPLETED";
+
     private final ProcessComplianceService complianceService;
     private final RabbitMQConsumer rabbitConsumer;
     private final MeterRegistry meterRegistry;
-    
+
     @PostConstruct
     public void start() throws Exception {
-        // Utilizar TypedEventHandler de plug-event-library para deserialización automática
         rabbitConsumer.connect();
         rabbitConsumer.startConsuming();
-        
-        log.info("ProcessEventConsumer started listening to process.event.completed");
+        log.info("ProcessEventConsumer started listening to process.event.lifecycle");
     }
-    
-    /**
-     * Maneja un evento de finalización de proceso.
-     * El EventMessage llega deserializado automáticamente.
-     * 
-     * Estructura esperada del EventMessage:
-     * - source: "asiento-cero-hub", "payment-processor", etc.
-     * - type: "EXECUTE_CRONJOB", "BATCH_COMPLETED", etc.
-     * - contextId: ID correlativo del flujo (opcional)
-     * - payload: {
-     *     "processKey": "asiento-cero-diario",
-     *     "executionId": "exec-20260619-001",
-     *     "status": "COMPLETED",
-     *     "durationMs": 540000,
-     *     "errorCode": null,
-     *     "errorMessage": null,
-     *     "metadata": {...}
-     *   }
-     */
+
     public void handleProcessEvent(EventMessage event) {
-        
         long startTime = System.currentTimeMillis();
-        
         try {
-            // 1. Extraer datos del payload
-            ProcessCompletionEventPayload payload = extractPayload(event);
-            
-            log.info("Processing event from source: {}, process: {}, execution: {}",
-                event.getSource(),
-                payload.getProcessKey(),
-                payload.getExecutionId());
-            
-            // 2. Validar estructura del payload
-            validatePayload(payload);
-            
-            // 3. Procesar evento
-            complianceService.processCompletionEvent(
-                payload,
-                event.getEventId(),    // Usar eventId de plug-event para trazabilidad
-                event.getSource(),     // Registrar origen
-                event.getTimestamp()   // Registrar timestamp del evento
-            );
-            
-            meterRegistry.counter(
-                "pce_events_processed_total",
-                "source", event.getSource()
-            ).increment();
-            
-            long duration = System.currentTimeMillis() - startTime;
-            log.debug("Event processed in {}ms", duration);
-            
+            ProcessLifecycleEventPayload payload = extractPayload(event);
+
+            log.info("Received event type={} source={} process={} execution={}",
+                event.getType(), event.getSource(),
+                payload.getProcessKey(), payload.getExecutionId());
+
+            validateRequiredFields(payload);
+
+            switch (event.getType()) {
+                case TYPE_STARTED ->
+                    complianceService.processStartEvent(
+                        payload, event.getEventId(), event.getSource(), event.getTimestamp());
+                case TYPE_COMPLETED ->
+                    complianceService.processCompletionEvent(
+                        payload, event.getEventId(), event.getSource(), event.getTimestamp());
+                default -> {
+                    log.warn("Unknown event type: {}", event.getType());
+                    meterRegistry.counter("pce_unknown_event_type_total",
+                        "type", event.getType()).increment();
+                }
+            }
+
+            meterRegistry.counter("pce_events_received_total",
+                "type", event.getType()).increment();
+
+            log.debug("Event {} processed in {}ms",
+                event.getEventId(), System.currentTimeMillis() - startTime);
+
         } catch (InvalidEventPayloadException e) {
             log.error("Invalid event payload: {}", e.getMessage());
             meterRegistry.counter("pce_invalid_events_total").increment();
-            // No reintentamos, el mensaje se descarta
-            
+            // No reintentamos eventos con contrato inválido
+
         } catch (Exception e) {
             log.error("Error processing event: {}", event.getEventId(), e);
             meterRegistry.counter("pce_processing_errors_total").increment();
-            // Relanzar excepción para que RabbitMQ reintente
             throw new EventProcessingException("Failed to process event", e);
         }
     }
-    
-    /**
-     * Extrae el payload del EventMessage.
-     * El payload contiene Map<String, Object> con los datos específicos.
-     */
-    private ProcessCompletionEventPayload extractPayload(EventMessage event) {
+
+    private ProcessLifecycleEventPayload extractPayload(EventMessage event) {
         try {
             Map<String, Object> payload = event.getPayload();
-            
-            return ProcessCompletionEventPayload.builder()
+            return ProcessLifecycleEventPayload.builder()
                 .processKey((String) payload.get("processKey"))
                 .executionId((String) payload.get("executionId"))
                 .status((String) payload.get("status"))
@@ -1301,14 +1286,13 @@ public class ProcessEventConsumer {
                 .errorMessage((String) payload.get("errorMessage"))
                 .metadata((Map<String, Object>) payload.get("metadata"))
                 .build();
-                
         } catch (Exception e) {
             throw new InvalidEventPayloadException(
-                "Failed to extract payload from event: " + e.getMessage(), e);
+                "Failed to extract payload: " + e.getMessage(), e);
         }
     }
-    
-    private void validatePayload(ProcessCompletionEventPayload payload) {
+
+    private void validateRequiredFields(ProcessLifecycleEventPayload payload) {
         if (payload.getProcessKey() == null || payload.getProcessKey().isBlank()) {
             throw new InvalidEventPayloadException("processKey is required");
         }
@@ -1351,20 +1335,16 @@ public class ProcessEventConsumer {
 // infrastructure/messaging/PlugEventConsumerConfig.java
 @Configuration
 public class PlugEventConsumerConfig {
-    
-    /**
-     * Configurar el RabbitMQConsumer de plug-event-library.
-     * Se utiliza un bean factory para crear la instancia del consumidor.
-     */
+
     @Bean
     public RabbitMQConsumer rabbitMQConsumer(
         @Value("${rabbitmq.host}") String host,
         @Value("${rabbitmq.port}") int port,
         @Value("${rabbitmq.username}") String username,
         @Value("${rabbitmq.password}") String password,
-        @Value("${rabbitmq.consumer.queue:process.event.completed}") String queue,
+        @Value("${rabbitmq.consumer.queue:process.event.lifecycle}") String queue,
         @Value("${rabbitmq.consumer.exchange:process.events}") String exchange,
-        @Value("${rabbitmq.consumer.routing-key:process.completed.*}") String routingKey,
+        @Value("${rabbitmq.consumer.routing-key:process.lifecycle.*}") String routingKey,
         @Value("${rabbitmq.consumer.prefetch:1}") int prefetch,
         ProcessEventConsumer processEventConsumer) {
 
@@ -1395,14 +1375,34 @@ public class PlugEventConsumerConfig {
 }
 ```
 
-### 9.4 Ejemplo de Estructura del Evento Recibido
+### 9.4 Ejemplos de Eventos Recibidos
 
+**Evento de inicio** (`routing key: process.lifecycle.started`):
 ```json
 {
   "eventId": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-  "timestamp": "2026-06-19T08:12:00.123456Z",
+  "timestamp": "2026-06-19T08:02:30.000000Z",
   "source": "asiento-cero-hub",
-  "type": "EXECUTE_CRONJOB",
+  "type": "PROCESS_STARTED",
+  "contextId": "daily-report-job",
+  "payload": {
+    "processKey": "asiento-cero-diario",
+    "executionId": "exec-20260619-001",
+    "status": "RUNNING",
+    "scheduledAt": "2026-06-19T08:00:00",
+    "startedAt": "2026-06-19T08:02:30",
+    "metadata": { "jobScheduleKey": "daily-balance", "region": "chile" }
+  }
+}
+```
+
+**Evento de fin** (`routing key: process.lifecycle.completed`):
+```json
+{
+  "eventId": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+  "timestamp": "2026-06-19T08:15:45.000000Z",
+  "source": "asiento-cero-hub",
+  "type": "PROCESS_COMPLETED",
   "contextId": "daily-report-job",
   "payload": {
     "processKey": "asiento-cero-diario",
@@ -1414,10 +1414,7 @@ public class PlugEventConsumerConfig {
     "durationMs": 789000,
     "errorCode": null,
     "errorMessage": null,
-    "metadata": {
-      "jobScheduleKey": "daily-balance",
-      "region": "chile"
-    }
+    "metadata": { "jobScheduleKey": "daily-balance", "region": "chile" }
   }
 }
 ```
@@ -1544,7 +1541,9 @@ rabbitmq:
   
   # Configuración de consumer
   consumer:
-    queue: process.event.completed
+    queue: process.event.lifecycle
+    exchange: process.events
+    routing-key: process.lifecycle.*   # captura started y completed
     prefetch: 1
     concurrency: 10
     max-concurrency: 50
@@ -1718,74 +1717,61 @@ public class ProcessComplianceServiceTest {
 ### Usando plug-producer-rabbitmq
 
 ```java
-// Ejemplo en el servicio asiento-cero-hub que publica eventos
+// Ejemplo en el servicio asiento-cero-hub que publica eventos de ciclo de vida
 
 @Component
-public class ProcessEventProducer {
-    
+public class ProcessLifecycleEventProducer {
+
     private final RabbitMQProducer producer;
-    
-    public void publishProcessCompletion(
-        String processKey,
-        String executionId,
-        String status,
-        long durationMs,
-        String errorCode,
-        String errorMessage,
-        Map<String, Object> metadata) {
-        
-        // 1. Construir payload
+
+    /** Publicar al iniciar el proceso. */
+    public void publishStart(String processKey, String executionId,
+            LocalDateTime scheduledAt, Map<String, Object> metadata) {
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("processKey", processKey);
+        payload.put("executionId", executionId);
+        payload.put("status", "RUNNING");
+        payload.put("scheduledAt", scheduledAt != null ? scheduledAt.toString() : null);
+        payload.put("startedAt", LocalDateTime.now().toString());
+        payload.put("metadata", metadata);
+
+        producer.publishEvent(EventMessage.create(
+            "asiento-cero-hub", "PROCESS_STARTED", processKey + "-job", payload));
+    }
+
+    /** Publicar al finalizar el proceso (éxito o fallo). */
+    public void publishCompletion(String processKey, String executionId,
+            String status, long durationMs,
+            String errorCode, String errorMessage,
+            Map<String, Object> metadata) {
+
         Map<String, Object> payload = new HashMap<>();
         payload.put("processKey", processKey);
         payload.put("executionId", executionId);
         payload.put("status", status);
-        payload.put("scheduledAt", LocalDateTime.now().minusSeconds(durationMs / 1000).toString());
-        payload.put("startedAt", LocalDateTime.now().minusSeconds(durationMs / 1000).toString());
         payload.put("endedAt", LocalDateTime.now().toString());
         payload.put("durationMs", durationMs);
         payload.put("errorCode", errorCode);
         payload.put("errorMessage", errorMessage);
         payload.put("metadata", metadata);
-        
-        // 2. Crear EventMessage usando plug-event-library
-        EventMessage event = EventMessage.create(
-            "asiento-cero-hub",        // source
-            "EXECUTE_CRONJOB",         // type
-            processKey + "-job",       // contextId
-            payload                    // payload
-        );
-        
-        // 3. Publicar evento
-        producer.publishEvent(event);
+
+        producer.publishEvent(EventMessage.create(
+            "asiento-cero-hub", "PROCESS_COMPLETED", processKey + "-job", payload));
     }
 }
 
-// Uso en el servicio después de completar un proceso
+// Uso en el servicio productor
+String executionId = "exec-20260619-001";
+producer.publishStart("asiento-cero-diario", executionId,
+    LocalDateTime.of(2026, 6, 19, 8, 0), Map.of("region", "chile"));
 try {
-    // ... ejecutar lógica del proceso ...
-    
-    // Publicar éxito
-    processEventProducer.publishProcessCompletion(
-        "asiento-cero-diario",
-        "exec-20260619-001",
-        "COMPLETED",
-        789000L,
-        null,
-        null,
-        Map.of("jobScheduleKey", "daily-balance", "region", "chile")
-    );
-    
+    // ... lógica del proceso ...
+    producer.publishCompletion("asiento-cero-diario", executionId,
+        "COMPLETED", 789000L, null, null, Map.of("region", "chile"));
 } catch (Exception e) {
-    // Publicar fallo
-    processEventProducer.publishProcessCompletion(
-        "asiento-cero-diario",
-        "exec-20260619-001",
-        "FAILED",
-        127000L,
-        "E101",
-        "Connection timeout to data source",
-        Map.of("jobScheduleKey", "daily-balance")
-    );
+    producer.publishCompletion("asiento-cero-diario", executionId,
+        "FAILED", 127000L, "E101", e.getMessage(), Map.of("region", "chile"));
 }
 ```
 
