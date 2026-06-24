@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What This Project Is
 
 A **Java 25 / Spring Boot 4** compliance engine that:
-1. Consumes process-completion events from RabbitMQ (`process.event.completed`)
-2. Evaluates configured rules against each execution (SLA, fail status, duplicates, etc.)
-3. Persists execution records in MySQL
+1. Consumes process lifecycle events (start + end) from RabbitMQ (`process.event.lifecycle`)
+2. Records execution start on `PROCESS_STARTED`; evaluates rules on `PROCESS_COMPLETED`
+3. Persists execution records in MySQL (two-phase: RUNNING → COMPLETED/FAILED)
 4. Publishes Prometheus metrics at `/metrics`
 
 Internal project — Flexibility Tech. Architecture is fully specified in `custom_docs/`; implementation is in progress.
@@ -50,10 +50,10 @@ mvn spring-boot:run                                  # start locally (once Sprin
 
 ```
 custom_docs/                         # Full design specs — read these before implementing
-src/main/java/com/flexibility/pce/
+src/main/java/com/flexibilitytech/pce/
 ├── application/        # Orchestration: @Transactional lives here only
-│   ├── service/        # ProcessComplianceService (main entry), ProcessExecutionService
-│   ├── event/          # ProcessCompletionEventPayload, ProcessCompletionEventHandler
+│   ├── service/        # ProcessComplianceService (processStartEvent + processCompletionEvent), ProcessExecutionService
+│   ├── event/          # ProcessLifecycleEventPayload, ProcessLifecycleEventHandler
 │   └── dto/            # EvaluationResultDTO, AlertDTO
 ├── domain/             # Pure business logic — zero Spring/infrastructure imports
 │   ├── entity/         # ProcessDefinition, ProcessRule, ProcessExecution, EvaluationResult
@@ -94,7 +94,8 @@ Each rule has `rule_type`, `operator` (GT/GTE/LT/LTE/EQ/NEQ/IN), `value_type` (N
 - **Hexagonal**: `domain/` has zero `@Component`, `@Repository`, `@Autowired`, or infrastructure imports.
 - **Evaluator pattern**: every `rule_type` maps to a `RuleEvaluator` bean registered in `RuleEvaluatorFactory` via `Map.entry(...)`. Adding a rule type = new class + one line in the factory.
 - **`@Transactional`**: application-layer services only; never on domain services.
-- **Idempotency**: `UNIQUE INDEX (process_key, execution_id)` guards double-processing. Duplicate events → log WARN + drop, no re-evaluation.
+- **Two-phase lifecycle**: `PROCESS_STARTED` → creates record with `status=RUNNING`, no rule evaluation. `PROCESS_COMPLETED` → updates record and evaluates rules. If `PROCESS_COMPLETED` arrives without a prior start record, create the full record before evaluating.
+- **Idempotency**: `UNIQUE INDEX (process_key, execution_id)` guards double-processing. Duplicate `PROCESS_STARTED` → log WARN + drop. Duplicate `PROCESS_COMPLETED` → log WARN + drop, no re-evaluation.
 - **Evaluator error handling**: catch, log at ERROR, increment `pce_rule_evaluation_error`, **continue** with remaining rules — never abort the evaluation loop on one rule failure.
 - **Cache invalidation**: both Caffeine caches listen to `config.sync.queue` via `CacheInvalidationListener` and evict on config-change events.
 - **No temporal rule validity**: no `valid_from`/`valid_to`. A rule is active if and only if `enabled = 1`.
@@ -103,12 +104,34 @@ Each rule has `rule_type`, `operator` (GT/GTE/LT/LTE/EQ/NEQ/IN), `value_type` (N
 
 ## Event Contract (plug-event-library)
 
+Two event types are consumed from queue `process.event.lifecycle`:
+
+**PROCESS_STARTED** (`routing key: process.lifecycle.started`):
 ```json
 {
   "eventId": "uuid",
-  "timestamp": "2026-06-19T08:12:00.123456Z",
+  "timestamp": "2026-06-19T08:02:30.000000Z",
   "source": "asiento-cero-hub",
-  "type": "EXECUTE_CRONJOB",
+  "type": "PROCESS_STARTED",
+  "contextId": "daily-report-job",
+  "payload": {
+    "processKey": "asiento-cero-diario",
+    "executionId": "exec-20260619-001",
+    "status": "RUNNING",
+    "scheduledAt": "2026-06-19T08:00:00",
+    "startedAt": "2026-06-19T08:02:30",
+    "metadata": {}
+  }
+}
+```
+
+**PROCESS_COMPLETED** (`routing key: process.lifecycle.completed`):
+```json
+{
+  "eventId": "uuid",
+  "timestamp": "2026-06-19T08:15:45.000000Z",
+  "source": "asiento-cero-hub",
+  "type": "PROCESS_COMPLETED",
   "contextId": "daily-report-job",
   "payload": {
     "processKey": "asiento-cero-diario",
@@ -125,7 +148,7 @@ Each rule has `rule_type`, `operator` (GT/GTE/LT/LTE/EQ/NEQ/IN), `value_type` (N
 }
 ```
 
-`processKey`, `executionId`, `status` are **required**. Missing any → `InvalidEventContractException` → discard (no retry). Do NOT use `@RabbitListener` — wire consumers through `plug-consumer-rabbitmq` via `RabbitMQConsumer.builder()`.
+`processKey`, `executionId`, `status` are **required** in both events. Missing any → `InvalidEventContractException` → discard (no retry). Unknown `type` → log WARN + drop. Do NOT use `@RabbitListener` — wire consumers through `plug-consumer-rabbitmq` via `RabbitMQConsumer.builder()`.
 
 ---
 
@@ -142,9 +165,9 @@ Each rule has `rule_type`, `operator` (GT/GTE/LT/LTE/EQ/NEQ/IN), `value_type` (N
 
 ```
 spring.datasource.url=jdbc:mysql://localhost:3306/process_engine?useSSL=false&serverTimezone=UTC
-rabbitmq.consumer.queue=process.event.completed
+rabbitmq.consumer.queue=process.event.lifecycle
 rabbitmq.consumer.exchange=process.events
-rabbitmq.consumer.routing-key=process.completed.*
+rabbitmq.consumer.routing-key=process.lifecycle.*
 rabbitmq.consumer.prefetch=1
 ```
 
