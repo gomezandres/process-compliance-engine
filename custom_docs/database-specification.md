@@ -4,10 +4,13 @@
 
 Esta especificacion define el modelo minimo de base de datos para evaluar cumplimiento de procesos.
 
-Regla operativa obligatoria:
+Reglas operativas obligatorias:
 
 - Si una regla existe para un proceso y `enabled = 1`, la regla se debe validar.
 - No se usa vigencia temporal por regla (`valid_from` o `valid_to`).
+- `process_execution` registra el ciclo de vida completo: el evento `PROCESS_STARTED` crea el registro con `status=RUNNING`; el evento `PROCESS_COMPLETED` actualiza el registro y dispara la evaluacion de reglas.
+- La evaluacion de reglas ocurre **unicamente** al recibir el evento de fin (`PROCESS_COMPLETED`).
+- Si llega un evento de fin sin registro previo de inicio, el motor crea el registro completo y evalua de igual forma.
 
 ---
 
@@ -66,33 +69,36 @@ CREATE TABLE process_rule (
 
 ### 2.3 process_execution
 
-Registra las ejecuciones de cada proceso para validar cumplimiento y detectar patrones de incumplimiento.
+Registra el ciclo de vida completo de cada ejecucion. El registro se crea con `status=RUNNING` al recibir el evento de inicio y se actualiza al recibir el evento de fin.
+
+Columnas de fin (`ended_at`, `duration_ms`, `error_code`, `error_message`) permanecen `NULL` mientras la ejecucion esta en curso.
 
 ```sql
 CREATE TABLE process_execution (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   execution_id VARCHAR(120) NOT NULL,
   process_key VARCHAR(120) NOT NULL,
-  
+
   scheduled_at DATETIME NULL,
-  started_at DATETIME NULL,
-  ended_at DATETIME NULL,
-  duration_ms BIGINT UNSIGNED NULL,
-  
-  status ENUM('RUNNING','COMPLETED','FAILED','SKIPPED','UNKNOWN') NOT NULL DEFAULT 'UNKNOWN',
-  error_code VARCHAR(60) NULL,
-  error_message VARCHAR(500) NULL,
-  
-  metadata JSON NULL,
+  started_at   DATETIME NULL,
+  ended_at     DATETIME NULL,        -- NULL hasta recibir PROCESS_COMPLETED
+  duration_ms  BIGINT UNSIGNED NULL, -- NULL hasta recibir PROCESS_COMPLETED
+
+  status ENUM('RUNNING','COMPLETED','FAILED','SKIPPED','UNKNOWN') NOT NULL DEFAULT 'RUNNING',
+  error_code    VARCHAR(60)  NULL,   -- NULL hasta recibir PROCESS_COMPLETED
+  error_message VARCHAR(500) NULL,   -- NULL hasta recibir PROCESS_COMPLETED
+
+  metadata   JSON     NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  
+
   CONSTRAINT chk_status CHECK (status IN ('RUNNING','COMPLETED','FAILED','SKIPPED','UNKNOWN')),
   INDEX idx_execution_process (process_key),
-  INDEX idx_execution_id (execution_id),
+  INDEX idx_execution_id      (execution_id),
   INDEX idx_execution_created (process_key, created_at),
+  INDEX idx_execution_running (process_key, status, started_at), -- para detectar procesos colgados
   UNIQUE INDEX idx_execution_unique (process_key, execution_id),
-  
+
   CONSTRAINT fk_execution_process
     FOREIGN KEY (process_key) REFERENCES process_definition(process_key)
     ON DELETE CASCADE
@@ -191,7 +197,25 @@ VALUES
 ```
 
 ```sql
--- Registro de ejecucion completada
+-- Paso 1: registro creado por evento PROCESS_STARTED (columnas de fin son NULL)
+INSERT INTO process_execution
+(execution_id, process_key, scheduled_at, started_at, status)
+VALUES
+('exec-20240115-001', 'asiento-cero-diario', '2024-01-15 08:00:00', '2024-01-15 08:02:30', 'RUNNING');
+```
+
+```sql
+-- Paso 2: actualizacion por evento PROCESS_COMPLETED (dispara evaluacion de reglas)
+UPDATE process_execution
+SET ended_at    = '2024-01-15 08:15:45',
+    duration_ms = 789000,
+    status      = 'COMPLETED'
+WHERE process_key  = 'asiento-cero-diario'
+  AND execution_id = 'exec-20240115-001';
+```
+
+```sql
+-- Alternativa: registro completo cuando llega PROCESS_COMPLETED sin inicio previo
 INSERT INTO process_execution
 (execution_id, process_key, scheduled_at, started_at, ended_at, duration_ms, status)
 VALUES
@@ -200,10 +224,14 @@ VALUES
 
 ```sql
 -- Registro de ejecucion fallida con codigo de error
-INSERT INTO process_execution
-(execution_id, process_key, scheduled_at, started_at, ended_at, duration_ms, status, error_code, error_message)
-VALUES
-('exec-20240115-002', 'asiento-cero-diario', '2024-01-15 09:00:00', '2024-01-15 09:01:15', '2024-01-15 09:03:22', 127000, 'FAILED', 'E101', 'Connection timeout to data source');
+UPDATE process_execution
+SET ended_at      = '2024-01-15 09:03:22',
+    duration_ms   = 127000,
+    status        = 'FAILED',
+    error_code    = 'E101',
+    error_message = 'Connection timeout to data source'
+WHERE process_key  = 'asiento-cero-diario'
+  AND execution_id = 'exec-20240115-002';
 ```
 
 ---
@@ -220,15 +248,16 @@ WHERE process_key = ?
 ORDER BY id ASC;
 ```
 
-### 5.1 Consulta de ultima ejecucion por proceso
+### 5.1 Consulta de ultima ejecucion completada por proceso
 
-Para validar si un proceso se ejecutó recientemente (usado por regla `MISSED_SCHEDULE`):
+Para validar si un proceso se ejecuto recientemente (usado por regla `MISSED_SCHEDULE`):
 
 ```sql
 SELECT *
 FROM process_execution
 WHERE process_key = ?
-ORDER BY created_at DESC
+  AND status IN ('COMPLETED', 'FAILED')
+ORDER BY ended_at DESC
 LIMIT 1;
 ```
 
@@ -244,15 +273,48 @@ WHERE process_key = ?
 ORDER BY created_at DESC;
 ```
 
+### 5.3 Consulta de procesos colgados
+
+Ejecuciones que llevan mas tiempo del SLA esperado sin recibir evento de fin.
+Usada por un job periodico para detectar procesos que iniciaron pero nunca completaron.
+
+```sql
+SELECT pe.execution_id,
+       pe.process_key,
+       pe.started_at,
+       TIMESTAMPDIFF(MINUTE, pe.started_at, NOW()) AS minutes_running,
+       pd.schedule_grace_minutes
+FROM process_execution pe
+JOIN process_definition pd ON pd.process_key = pe.process_key
+WHERE pe.status = 'RUNNING'
+  AND pe.started_at < DATE_SUB(NOW(), INTERVAL pd.schedule_grace_minutes MINUTE)
+ORDER BY pe.started_at ASC;
+```
+
 ---
 
 ## 6. Reglas de evaluacion (comportamiento esperado)
 
-- Si llega un evento con `process_key` sin registro en `process_definition`, el motor debe generar alerta de configuracion (severidad recomendada: `WARNING` o `CRITICAL` segun impacto) para que el equipo complete el alta del proceso.
+### 6.1 Evento PROCESS_STARTED
+
+- El motor crea un registro en `process_execution` con `status=RUNNING`.
+- Si ya existe un registro para `(process_key, execution_id)`, el evento se descarta (duplicado).
+- No se evaluan reglas en este punto.
+
+### 6.2 Evento PROCESS_COMPLETED
+
+- Si no existe registro previo de inicio, el motor crea el registro completo antes de evaluar.
+- Si llega un evento con `process_key` sin registro en `process_definition`, el motor genera alerta de configuracion (severidad recomendada: `WARNING` o `CRITICAL` segun impacto).
 - Si no existen reglas activas para el proceso, el motor registra `PASS` por ausencia de reglas.
-- Si existen reglas activas, el motor evalua todas las reglas habilitadas.
+- Si existen reglas activas, el motor evalua **todas** las reglas habilitadas.
 - Si una o mas reglas fallan, el resultado global es `FAIL` y se generan alertas segun severidad.
 - Si todas pasan, el resultado global es `PASS`.
+
+### 6.3 Deteccion de procesos colgados
+
+- Un job periodico consulta `process_execution` buscando registros con `status=RUNNING` cuyo `started_at` supere la ventana `schedule_grace_minutes` de la definicion.
+- Estos registros se marcan con `status=UNKNOWN` y se genera alerta de severidad `WARNING`.
+- Esta deteccion opera fuera del flujo de eventos, a demanda del scheduler.
 
 ---
 
@@ -263,3 +325,5 @@ ORDER BY created_at DESC;
 - Evitar reglas duplicadas por (`process_key`, `rule_type`, `enabled`) cuando aplique al dominio.
 - Definir `schedule_cron` y `schedule_timezone` por proceso para poder detectar ejecuciones omitidas.
 - Usar `schedule_grace_minutes` para evitar falsos positivos por retrasos menores del orquestador.
+- El indice `idx_execution_running (process_key, status, started_at)` es critico para la consulta de procesos colgados; no eliminarlo.
+- Hacer purga periodica de registros con `status=RUNNING` muy antiguos (>24hs) que nunca recibieron evento de fin, marcandolos como `UNKNOWN`.
