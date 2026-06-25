@@ -47,7 +47,12 @@ tasks:
     desc: "Start the Spring Boot application (requires RabbitMQ up)"
     dir: "{{.TASKFILE_DIR}}/.."
     cmds:
-      - mvn spring-boot:run -Dspring-boot.run.jvmArguments="--enable-preview"
+      - |
+        if [ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk use java 25.0.3-amzn
+        fi
+        mvn spring-boot:run -Dspring-boot.run.jvmArguments="--enable-preview"
 
   # ─── Composite ───────────────────────────────────────────────────────────────
 
