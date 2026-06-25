@@ -17,17 +17,17 @@ tasks:
   rabbitmq:up:
     desc: "Start RabbitMQ container in background (auto-removed on stop)"
     cmds:
-      - docker run --rm -d --name {{.CONTAINER}} -p {{.AMQP_PORT}}:5672 -p {{.MGMT_PORT}}:15672 -e RABBITMQ_DEFAULT_USER=guest -e RABBITMQ_DEFAULT_PASS=guest -v "{{.TASKFILE_DIR}}/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro" -v "{{.TASKFILE_DIR}}/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" rabbitmq:3.13-management
+      - docker run --rm -d --name {{.CONTAINER}} -p {{.AMQP_PORT}}:5672 -p {{.MGMT_PORT}}:15672 -v "{{.TASKFILE_DIR}}/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro" -v "{{.TASKFILE_DIR}}/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" rabbitmq:3.13-management
       - task: rabbitmq:wait
 
   rabbitmq:wait:
-    desc: "Wait until RabbitMQ management API is healthy"
+    desc: "Wait until RabbitMQ AMQP port is ready"
     silent: true
     cmds:
       - |
         echo "Waiting for RabbitMQ..."
-        until curl -s -u guest:guest http://localhost:{{.MGMT_PORT}}/api/aliveness-test/%2F 2>/dev/null | grep -q '"status":"ok"'; do
-          sleep 2
+        until bash -c "echo > /dev/tcp/localhost/{{.AMQP_PORT}}" 2>/dev/null; do
+          sleep 1
         done
         echo "RabbitMQ ready — management UI at http://localhost:{{.MGMT_PORT}} (guest/guest)"
 
