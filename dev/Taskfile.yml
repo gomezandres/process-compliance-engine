@@ -17,16 +17,7 @@ tasks:
   rabbitmq:up:
     desc: "Start RabbitMQ container in background (auto-removed on stop)"
     cmds:
-      - |
-        docker run --rm -d \
-          --name {{.CONTAINER}} \
-          -p {{.AMQP_PORT}}:5672 \
-          -p {{.MGMT_PORT}}:15672 \
-          -e RABBITMQ_DEFAULT_USER=guest \
-          -e RABBITMQ_DEFAULT_PASS=guest \
-          -v "{{.TASKFILE_DIR}}/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro" \
-          -v "{{.TASKFILE_DIR}}/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
-          rabbitmq:3.13-management
+      - docker run --rm -d --name {{.CONTAINER}} -p {{.AMQP_PORT}}:5672 -p {{.MGMT_PORT}}:15672 -e RABBITMQ_DEFAULT_USER=guest -e RABBITMQ_DEFAULT_PASS=guest -v "{{.TASKFILE_DIR}}/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro" -v "{{.TASKFILE_DIR}}/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" rabbitmq:3.13-management
       - task: rabbitmq:wait
 
   rabbitmq:wait:
