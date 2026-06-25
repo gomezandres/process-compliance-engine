@@ -1,0 +1,72 @@
+version: '3'
+
+vars:
+  CONTAINER: pce-rabbitmq
+  AMQP_PORT: "5672"
+  MGMT_PORT: "15672"
+
+tasks:
+  default:
+    desc: "List available tasks"
+    silent: true
+    cmds:
+      - task --list
+
+  # ─── RabbitMQ ────────────────────────────────────────────────────────────────
+
+  rabbitmq:up:
+    desc: "Start RabbitMQ container in background (auto-removed on stop)"
+    cmds:
+      - |
+        docker run --rm -d \
+          --name {{.CONTAINER}} \
+          -p {{.AMQP_PORT}}:5672 \
+          -p {{.MGMT_PORT}}:15672 \
+          -e RABBITMQ_DEFAULT_USER=guest \
+          -e RABBITMQ_DEFAULT_PASS=guest \
+          -v "{{.TASKFILE_DIR}}/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro" \
+          -v "{{.TASKFILE_DIR}}/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+          rabbitmq:3.13-management
+      - task: rabbitmq:wait
+
+  rabbitmq:wait:
+    desc: "Wait until RabbitMQ is accepting connections"
+    silent: true
+    cmds:
+      - |
+        echo "Waiting for RabbitMQ..."
+        until docker exec {{.CONTAINER}} rabbitmq-diagnostics check_running --quiet 2>/dev/null; do
+          sleep 2
+        done
+        echo "RabbitMQ ready — management UI at http://localhost:{{.MGMT_PORT}} (guest/guest)"
+
+  rabbitmq:down:
+    desc: "Stop RabbitMQ container (removed automatically)"
+    cmds:
+      - docker stop {{.CONTAINER}} || true
+
+  rabbitmq:logs:
+    desc: "Tail RabbitMQ logs"
+    cmds:
+      - docker logs -f {{.CONTAINER}}
+
+  # ─── Application ─────────────────────────────────────────────────────────────
+
+  app:run:
+    desc: "Start the Spring Boot application (requires RabbitMQ up)"
+    dir: "{{.TASKFILE_DIR}}/.."
+    cmds:
+      - mvn spring-boot:run -Dspring-boot.run.jvmArguments="--enable-preview"
+
+  # ─── Composite ───────────────────────────────────────────────────────────────
+
+  up:
+    desc: "Start RabbitMQ (background) then application (foreground)"
+    cmds:
+      - task: rabbitmq:up
+      - task: app:run
+
+  down:
+    desc: "Stop RabbitMQ (application must be stopped manually with Ctrl+C)"
+    cmds:
+      - task: rabbitmq:down

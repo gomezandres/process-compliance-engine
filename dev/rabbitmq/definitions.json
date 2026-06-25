@@ -1,0 +1,53 @@
+{
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "permissions": [
+    {
+      "user": "guest",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "process.events",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "queues": [
+    {
+      "name": "process.event.lifecycle",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "exclusive": false,
+      "arguments": {}
+    },
+    {
+      "name": "config.sync.queue",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "exclusive": false,
+      "arguments": {}
+    }
+  ],
+  "bindings": [
+    {
+      "source": "process.events",
+      "vhost": "/",
+      "destination": "process.event.lifecycle",
+      "destination_type": "queue",
+      "routing_key": "process.lifecycle.*",
+      "arguments": {}
+    }
+  ]
+}
