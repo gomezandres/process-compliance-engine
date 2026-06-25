@@ -7,10 +7,10 @@ vars:
 
 tasks:
   default:
-    desc: "List available tasks"
-    silent: true
+    desc: "Start RabbitMQ (background) then application (foreground)"
     cmds:
-      - task --list
+      - task: rabbitmq:up
+      - task: app:run
 
   # ─── RabbitMQ ────────────────────────────────────────────────────────────────
 
@@ -30,12 +30,12 @@ tasks:
       - task: rabbitmq:wait
 
   rabbitmq:wait:
-    desc: "Wait until RabbitMQ is accepting connections"
+    desc: "Wait until RabbitMQ management API is healthy"
     silent: true
     cmds:
       - |
         echo "Waiting for RabbitMQ..."
-        until docker exec {{.CONTAINER}} rabbitmq-diagnostics check_running --quiet 2>/dev/null; do
+        until curl -s -u guest:guest http://localhost:{{.MGMT_PORT}}/api/aliveness-test/%2F 2>/dev/null | grep -q '"status":"ok"'; do
           sleep 2
         done
         echo "RabbitMQ ready — management UI at http://localhost:{{.MGMT_PORT}} (guest/guest)"
